@@ -1,21 +1,25 @@
+import abc
+import json
+import logging
+import os
+import re
+import time
+import argparse
+import threading
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, Iterable, List, Optional, Set
+
 import jsonlines
 import requests
-import re
-import json
-import time
-import logging
-from tqdm import tqdm
 import PyPDF2
-from datetime import datetime, timedelta
 import psutil
-import argparse
-import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
 import textacy.preprocessing as preprocessing
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 import spacy
+from sklearn.decomposition import NMF
+from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from tqdm import tqdm
 
 # Configure logging
 logging.basicConfig(
@@ -31,9 +35,9 @@ logger = logging.getLogger(__name__)
 # Load spaCy for named entity recognition and sentence segmentation
 nlp = spacy.load("en_core_web_sm")
 
-# Default historical keywords - users can modify this set in the config section
-DEFAULT_HISTORICAL_KEYWORDS = {
-    'war', 'battle', 'conflict', 'treaty', 'empire', 'kingdom', 'dynasty', 'ruler', 
+# Default domain keywords for a history-oriented dataset; method-specific extracts can replace this.
+DEFAULT_DOMAIN_KEYWORDS = {
+    'war', 'battle', 'conflict', 'treaty', 'empire', 'kingdom', 'dynasty', 'ruler',
     'king', 'queen', 'emperor', 'chief', 'leader', 'revolution', 'independence',
     'colonial', 'colony', 'settlement', 'migration', 'civilization', 'culture',
     'tradition', 'ritual', 'ceremony', 'religion', 'missionary', 'trade',
@@ -42,19 +46,122 @@ DEFAULT_HISTORICAL_KEYWORDS = {
     'century', 'decade', 'era', 'period', 'age', 'epoch'
 }
 
-def load_custom_keywords(keywords_file="keywords.txt"):
-    """Load custom historical keywords from a file if it exists."""
-    if os.path.exists(keywords_file):
+DEFAULT_PROMPT_TEMPLATE = '''
+You are a domain expert tasked with generating 1-12 high-quality question-answer pairs from a given text passage for a fine-tuned question-answering model.
+Your output MUST be a valid JSON array containing 1-12 objects, each with the fields "instruction", "input", and "output".
+Do NOT include any text outside the JSON array.
+
+Generate Q&A pairs based only on the passage below.
+
+Passage:
+<START_PASSAGE>
+{chunk}
+<END_PASSAGE>
+'''
+
+class KeywordExtractor(abc.ABC):
+    def __init__(self, custom_keywords: Optional[Iterable[str]] = None):
+        self.custom_keywords: Set[str] = set(x.lower() for x in custom_keywords or [])
+
+    @abc.abstractmethod
+    def extract(self, text: str) -> Set[str]:
+        raise NotImplementedError
+
+    def get_keywords(self, text: str) -> Set[str]:
+        extracted = self.extract(text)
+        return self.custom_keywords | extracted
+
+class StaticKeywordExtractor(KeywordExtractor):
+    def __init__(self, keywords_file: str = "keywords.txt", default_keywords: Optional[Set[str]] = None):
+        self.keywords_file = keywords_file
+        self.default_keywords = default_keywords or set()
+        custom_keywords = self._load_keywords_from_file()
+        super().__init__(custom_keywords=custom_keywords)
+
+    def _load_keywords_from_file(self) -> Set[str]:
+        if not os.path.exists(self.keywords_file):
+            return set()
         try:
-            with open(keywords_file, 'r', encoding='utf-8') as f:
-                custom_keywords = set(line.strip().lower() for line in f if line.strip())
-            print(f"Loaded {len(custom_keywords)} custom keywords from {keywords_file}")
-            logger.info(f"Loaded {len(custom_keywords)} custom keywords from {keywords_file}")
-            return custom_keywords
+            with open(self.keywords_file, 'r', encoding='utf-8') as f:
+                return {
+                    line.strip().lower()
+                    for line in f
+                    if line.strip() and not line.strip().startswith('#')
+                }
         except Exception as e:
-            print(f"Error loading keywords file: {e}. Using default keywords.")
-            logger.warning(f"Error loading keywords file: {e}. Using default keywords.")
-    return DEFAULT_HISTORICAL_KEYWORDS
+            logger.warning(f"Unable to load keywords file {self.keywords_file}: {e}")
+            return set()
+
+    def extract(self, text: str) -> Set[str]:
+        return self.default_keywords | self.custom_keywords
+
+class TfIdfKeywordExtractor(KeywordExtractor):
+    def __init__(self, custom_keywords: Optional[Iterable[str]] = None, top_n: int = 50,
+                 ngram_range=(1, 2), stop_words='english'):
+        super().__init__(custom_keywords=custom_keywords)
+        self.top_n = top_n
+        self.ngram_range = ngram_range
+        self.stop_words = stop_words
+
+    def extract(self, text: str) -> Set[str]:
+        try:
+            vectorizer = TfidfVectorizer(stop_words=self.stop_words, ngram_range=self.ngram_range, max_features=2000)
+            matrix = vectorizer.fit_transform([text])
+            if matrix.shape[1] == 0:
+                return set()
+            scores = matrix.toarray()[0]
+            terms = vectorizer.get_feature_names_out()
+            top_terms = sorted(
+                ((term, score) for term, score in zip(terms, scores) if len(term) > 2),
+                key=lambda item: item[1],
+                reverse=True
+            )[:self.top_n]
+            return {term for term, _ in top_terms}
+        except Exception as e:
+            logger.warning(f"TF-IDF keyword extraction failed: {e}")
+            return set()
+
+class NmfKeywordExtractor(KeywordExtractor):
+    def __init__(self, custom_keywords: Optional[Iterable[str]] = None, n_topics: int = 4, top_n: int = 50,
+                 ngram_range=(1, 2), stop_words='english'):
+        super().__init__(custom_keywords=custom_keywords)
+        self.n_topics = n_topics
+        self.top_n = top_n
+        self.ngram_range = ngram_range
+        self.stop_words = stop_words
+
+    def extract(self, text: str) -> Set[str]:
+        try:
+            vectorizer = CountVectorizer(stop_words=self.stop_words, ngram_range=self.ngram_range, max_features=3000)
+            matrix = vectorizer.fit_transform([text])
+            if matrix.shape[1] == 0:
+                return set()
+            n_components = min(self.n_topics, matrix.shape[1])
+            nmf_model = NMF(n_components=n_components, random_state=42, max_iter=200)
+            nmf_model.fit(matrix)
+            feature_names = vectorizer.get_feature_names_out()
+            topics = nmf_model.components_
+            keyword_scores: Dict[str, float] = {}
+            for topic in topics:
+                for term_index, score in enumerate(topic):
+                    keyword_scores[feature_names[term_index]] = keyword_scores.get(feature_names[term_index], 0.0) + score
+            most_common = sorted(keyword_scores.items(), key=lambda item: item[1], reverse=True)[:self.top_n]
+            return {term for term, _ in most_common if len(term) > 2}
+        except Exception as e:
+            logger.warning(f"NMF keyword extraction failed: {e}")
+            return set()
+
+
+def create_keyword_extractor(method: str, keywords_file: str = "keywords.txt",
+                             custom_keywords: Optional[Iterable[str]] = None) -> KeywordExtractor:
+    method = method.lower()
+    if method == 'static':
+        return StaticKeywordExtractor(keywords_file=keywords_file, default_keywords=DEFAULT_DOMAIN_KEYWORDS)
+    if method == 'tfidf':
+        return TfIdfKeywordExtractor(custom_keywords=custom_keywords)
+    if method == 'nmf':
+        return NmfKeywordExtractor(custom_keywords=custom_keywords)
+    raise ValueError(f"Unknown keyword extraction method: {method}")
 
 def check_ollama_health():
     """Check if Ollama server is running."""
@@ -96,41 +203,53 @@ def log_system_metrics(chunk_index):
         print(f"Could not retrieve GPU metrics: {str(e)}")
         logger.warning(f"Could not retrieve GPU metrics: {str(e)}")
 
-def read_pdf_text(pdf_path):
-    """Read text from a PDF file."""
+def read_text_file(path: str) -> str:
+    """Read text from a plain text file."""
     start_time = time.time()
     try:
-        with open(pdf_path, 'rb') as file:
-            reader = PyPDF2.PdfReader(file)
-            text = ""
-            for page in reader.pages:
-                page_text = page.extract_text() or ""
-                text += page_text + "\n"
-        print(f"Read PDF: {len(text)} characters in {time.time() - start_time:.2f}s")
-        logger.info(f"Read PDF: {len(text)} characters in {time.time() - start_time:.2f}s")
-        
-        # Check for historical keywords
-        historical_keywords = load_custom_keywords()
-        found_keywords = [k for k in historical_keywords if k in text.lower()]
-        print(f"Historical keywords found: {found_keywords[:10]}...")  # Show first 10
-        logger.info(f"Historical keywords found: {found_keywords[:10]}...")
-        if not found_keywords:
-            print("Warning: PDF text may lack sufficient historical content for Q&A generation")
-            logger.warning("PDF text may lack sufficient historical content for Q&A generation")
+        with open(path, 'r', encoding='utf-8', errors='replace') as file:
+            text = file.read()
+        print(f"Read text file: {len(text)} characters in {time.time() - start_time:.2f}s")
+        logger.info(f"Read text file: {len(text)} characters in {time.time() - start_time:.2f}s")
         return text
     except Exception as e:
-        print(f"Error reading PDF {pdf_path}: {str(e)}")
-        logger.error(f"Error reading PDF {pdf_path}: {str(e)}")
+        print(f"Error reading text file {path}: {str(e)}")
+        logger.error(f"Error reading text file {path}: {str(e)}")
         return ""
 
-def chunk_text(text, max_chars=800, overlap=200, min_chunks=3):
-    """Split text into semantically meaningful chunks."""
-    historical_keywords = load_custom_keywords()
+
+def read_document_text(path: str) -> str:
+    """Read text from a supported document type."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == '.pdf':
+        try:
+            with open(path, 'rb') as file:
+                reader = PyPDF2.PdfReader(file)
+                text = ""
+                for page in reader.pages:
+                    page_text = page.extract_text() or ""
+                    text += page_text + "\n"
+            print(f"Read PDF: {len(text)} characters")
+            logger.info(f"Read PDF: {len(text)} characters")
+            return text
+        except Exception as e:
+            print(f"Error reading PDF {path}: {str(e)}")
+            logger.error(f"Error reading PDF {path}: {str(e)}")
+            return ""
+    if ext in {'.txt', '.md', '.csv'}:
+        return read_text_file(path)
+    print(f"Unknown extension {ext}. Trying to read as text.")
+    logger.info(f"Unknown extension {ext}. Trying to read as text.")
+    return read_text_file(path)
+
+
+def chunk_text(text: str, keyword_set: Set[str], max_chars=800, overlap=200, min_chunks=3) -> List[str]:
+    """Split text into semantically meaningful chunks using domain keywords or named entities."""
     doc = nlp(text)
-    chunks = []
+    chunks: List[str] = []
     current_chunk = ""
     current_length = 0
-    
+
     # Try splitting by paragraphs
     paragraphs = re.split(r'\n\s*\n', text)
     for para in paragraphs:
@@ -138,14 +257,17 @@ def chunk_text(text, max_chars=800, overlap=200, min_chunks=3):
         if not para:
             continue
         para_doc = nlp(para)
-        has_historical_content = any(keyword in para.lower() for keyword in historical_keywords) or \
-                                any(ent.label_ in {'PERSON', 'GPE', 'ORG', 'DATE', 'EVENT'} for ent in para_doc.ents)
-        if not has_historical_content:
-            print(f"Discarded paragraph (no historical content): {para[:100]}...")
-            logger.debug(f"Discarded paragraph (no historical content): {para[:100]}...")
+        has_domain_content = (
+            not keyword_set or
+            any(keyword in para.lower() for keyword in keyword_set) or
+            any(ent.label_ in {'PERSON', 'GPE', 'ORG', 'DATE', 'EVENT'} for ent in para_doc.ents)
+        )
+        if not has_domain_content:
+            print(f"Discarded paragraph (no domain content): {para[:100]}...")
+            logger.debug(f"Discarded paragraph (no domain content): {para[:100]}...")
             continue
         para_length = len(para)
-        
+
         if current_length + para_length <= max_chars:
             current_chunk += para + "\n\n"
             current_length += para_length + 2
@@ -154,10 +276,10 @@ def chunk_text(text, max_chars=800, overlap=200, min_chunks=3):
                 chunks.append(current_chunk.strip())
             current_chunk = para[-overlap:] if len(para) > overlap else para
             current_length = len(current_chunk)
-    
+
     if current_chunk:
         chunks.append(current_chunk.strip())
-    
+
     # If too few chunks, split by sentences
     if len(chunks) < min_chunks and text:
         chunks = []
@@ -168,11 +290,14 @@ def chunk_text(text, max_chars=800, overlap=200, min_chunks=3):
             if not sent_text:
                 continue
             sent_length = len(sent_text)
-            has_historical_content = any(keyword in sent_text.lower() for keyword in historical_keywords) or \
-                                    any(ent.label_ in {'PERSON', 'GPE', 'ORG', 'DATE', 'EVENT'} for ent in sent.ents)
-            if not has_historical_content:
-                print(f"Discarded sentence (no historical content): {sent_text[:100]}...")
-                logger.debug(f"Discarded sentence (no historical content): {sent_text[:100]}...")
+            has_domain_content = (
+                not keyword_set or
+                any(keyword in sent_text.lower() for keyword in keyword_set) or
+                any(ent.label_ in {'PERSON', 'GPE', 'ORG', 'DATE', 'EVENT'} for ent in sent.ents)
+            )
+            if not has_domain_content:
+                print(f"Discarded sentence (no domain content): {sent_text[:100]}...")
+                logger.debug(f"Discarded sentence (no domain content): {sent_text[:100]}...")
                 continue
             if current_length + sent_length <= max_chars:
                 current_chunk += sent_text + " "
@@ -184,44 +309,44 @@ def chunk_text(text, max_chars=800, overlap=200, min_chunks=3):
                 current_length = len(current_chunk)
         if current_chunk:
             chunks.append(current_chunk.strip())
-    
+
     print(f"Split text into {len(chunks)} chunks (text length: {len(text)} chars)")
     logger.info(f"Split text into {len(chunks)} chunks (text length: {len(text)} chars)")
     return chunks
 
 def normalize_text(text):
     """Normalize text to handle case sensitivity and clean up."""
-    return preprocessing.normalize.unicode(text.lower())
+    #return preprocessing.normalize.unicode(text.lower())
+    return preprocessing.normalize.unicode(text)
 
-def is_historical_qa(question, answer):
-    """Check if Q&A pair is historical using named entity recognition or keywords."""
+
+def is_domain_qa(question: str, answer: str, keyword_set: Set[str]) -> bool:
+    """Check if a Q&A pair belongs to the document domain using named entities or keywords."""
     doc_q = nlp(question)
     doc_a = nlp(answer)
-    historical_keywords = load_custom_keywords()
     has_entities = any(ent.label_ in {'PERSON', 'GPE', 'ORG', 'DATE', 'EVENT'} for ent in doc_q.ents + doc_a.ents)
-    has_keywords = any(keyword in question.lower() or keyword in answer.lower() for keyword in historical_keywords)
+    if not keyword_set:
+        return has_entities or len(answer) >= 100
+    has_keywords = any(keyword in question.lower() or keyword in answer.lower() for keyword in keyword_set)
     return has_entities or has_keywords
 
-def deduplicate_qa_pairs(pairs):
+def deduplicate_qa_pairs(pairs: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """Remove duplicate Q&A pairs based on semantic similarity."""
     if not pairs:
         return pairs
-    
+
     texts = [pair["instruction"] + " " + pair["output"] for pair in pairs]
     vectorizer = TfidfVectorizer()
     tfidf_matrix = vectorizer.fit_transform(texts)
     similarity_matrix = cosine_similarity(tfidf_matrix)
-    
+
     keep_indices = []
     for i in range(len(pairs)):
-        if i not in keep_indices:
-            for j in range(i + 1, len(pairs)):
-                if similarity_matrix[i][j] > 0.9:  # Threshold for near-duplicates
-                    continue
-                keep_indices.append(j)
-            keep_indices.append(i)
-    
-    deduped_pairs = [pairs[i] for i in sorted(set(keep_indices))]
+        if any(similarity_matrix[i][j] > 0.9 for j in keep_indices):
+            continue
+        keep_indices.append(i)
+
+    deduped_pairs = [pairs[i] for i in keep_indices]
     print(f"Deduplicated {len(pairs)} to {len(deduped_pairs)} Q&A pairs")
     logger.info(f"Deduplicated {len(pairs)} to {len(deduped_pairs)} Q&A pairs")
     return deduped_pairs[:12]  # Limit to 12 pairs
@@ -240,20 +365,19 @@ def fix_json_string(json_str):
         logger.error(f"Failed to fix JSON string: {str(e)}")
         return json_str
 
-def extract_relevant_input(chunk, question, full_text):
+def extract_relevant_input(chunk: str, question: str, full_text: str, keyword_set: Set[str]) -> str:
     """Extract relevant sentences from the chunk or full text for the input field."""
-    historical_keywords = load_custom_keywords()
     doc = nlp(chunk)
     relevant_sentences = []
-    question_keywords = set(normalize_text(question).split()) & historical_keywords
-    
+    question_keywords = set(normalize_text(question).split()) & keyword_set
+
     # First, try to find relevant sentences in the chunk
     for sent in doc.sents:
         sent_text = sent.text.strip()
         if any(keyword in normalize_text(sent_text) for keyword in question_keywords) or \
            any(ent.label_ in {'PERSON', 'GPE', 'ORG', 'DATE', 'EVENT'} for ent in sent.ents):
             relevant_sentences.append(sent_text)
-    
+
     # If no relevant sentences found, search the full text
     if not relevant_sentences:
         doc_full = nlp(full_text)
@@ -264,16 +388,17 @@ def extract_relevant_input(chunk, question, full_text):
                 relevant_sentences.append(sent_text)
                 if len(' '.join(relevant_sentences)) >= 800:
                     break
-    
+
     input_text = ' '.join(relevant_sentences)[:800]
     if not input_text:
         input_text = chunk[:800]  # Fallback to original chunk if no relevant sentences found
     return input_text
 
-def extract_json_array(text, chunk, full_text):
+
+def extract_json_array(text: str, chunk: str, full_text: str, keyword_set: Set[str]) -> List[Dict[str, str]]:
     """Extract JSON array from text, handling malformed cases."""
     exclude_patterns = [
-        r'who.*wrote', r'who.*authored', r'what.*title', r'what.*published', 
+        r'who.*wrote', r'who.*authored', r'what.*title', r'what.*published',
         r'what.*topic.*passage', r'what.*debate', r'what.*focus.*research',
         r'who.*supervisor', r'what.*permits', r'what.*financial', r'what.*table of contents',
         r'who.*mentioned', r'what.*orthography', r'who.*provided', r'what.*list',
@@ -290,37 +415,38 @@ def extract_json_array(text, chunk, full_text):
         parsed = json.loads(json_str)
         if not isinstance(parsed, list) or not all(isinstance(item, dict) for item in parsed):
             raise ValueError("Invalid JSON structure: not a list of dictionaries")
-        
-        filtered_pairs = []
+
+        filtered_pairs: List[Dict[str, str]] = []
         for item in parsed:
             question = normalize_text(item["instruction"])
             answer = normalize_text(item["output"])
-            if (not any(re.search(pattern, question) for pattern in exclude_patterns) and 
-                len(answer) >= 100 and is_historical_qa(question, answer)):
-                item["input"] = extract_relevant_input(chunk, question, full_text)
+            if (not any(re.search(pattern, question) for pattern in exclude_patterns) and
+                len(answer) >= 100 and is_domain_qa(question, answer, keyword_set)):
+                item["input"] = extract_relevant_input(chunk, question, full_text, keyword_set)
                 item["instruction"] = question.capitalize()
-                item["output"] = answer
+                item["output"] = item["output"].strip() # Keep original formatting for answer
                 filtered_pairs.append(item)
             else:
-                print(f"Filtered out Q&A pair: Q: {question}, A: {answer[:50]}... (non-historical or too short)")
-                logger.debug(f"Filtered out Q&A pair: Q: {question}, A: {answer[:50]}... (non-historical or too short)")
-        
+                print(f"Filtered out Q&A pair: Q: {question}, A: {answer[:50]}... (non-domain or too short)")
+                logger.debug(f"Filtered out Q&A pair: Q: {question}, A: {answer[:50]}... (non-domain or too short)")
+
         print(f"Parsed {len(filtered_pairs)} valid JSON Q&A pairs")
         logger.info(f"Parsed {len(filtered_pairs)} valid JSON Q&A pairs")
         return deduplicate_qa_pairs(filtered_pairs)
     except (json.JSONDecodeError, ValueError) as e:
         print(f"JSON parsing failed: {str(e)}. Non-JSON response:\n{text[:500]}...")
         logger.warning(f"JSON parsing failed: {str(e)}. Non-JSON response:\n{text[:500]}...")
-        return parse_qa_pairs(text, chunk, full_text)
+        return parse_qa_pairs(text, chunk, full_text, keyword_set)
 
-def parse_qa_pairs(text, chunk, full_text):
-    """Parse Q: A: pairs from non-JSON response, focusing on historical content."""
-    qa_pairs = []
+
+def parse_qa_pairs(text: str, chunk: str, full_text: str, keyword_set: Set[str]) -> List[Dict[str, str]]:
+    """Parse Q: A: pairs from non-JSON response, focusing on domain content."""
+    qa_pairs: List[Dict[str, str]] = []
     qa_pattern = re.compile(r'Q:\s*(.*?)\nA:\s*(.*?)(?=\nQ:|$)', re.DOTALL)
     matches = qa_pattern.findall(text)
     
     exclude_patterns = [
-        r'who.*wrote', r'who.*authored', r'what.*title', r'what.*published', 
+        r'who.*wrote', r'who.*authored', r'what.*title', r'what.*published',
         r'what.*topic.*passage', r'what.*debate', r'what.*focus.*research',
         r'who.*supervisor', r'what.*permits', r'what.*financial', r'what.*table of contents',
         r'who.*mentioned', r'what.*orthography', r'who.*provided', r'what.*list',
@@ -331,18 +457,18 @@ def parse_qa_pairs(text, chunk, full_text):
     for question, answer in matches:
         question = normalize_text(question.strip())
         answer = normalize_text(answer.strip())
-        if (not any(re.search(pattern, question) for pattern in exclude_patterns) and 
-            len(answer) >= 100 and is_historical_qa(question, answer)):
+        if (not any(re.search(pattern, question) for pattern in exclude_patterns) and
+            len(answer) >= 100 and is_domain_qa(question, answer, keyword_set)):
             qa_pairs.append({
                 "instruction": question.capitalize(),
-                "input": extract_relevant_input(chunk, question, full_text),
+                "input": extract_relevant_input(chunk, question, full_text, keyword_set),
                 "output": answer
             })
             print(f"Accepted Q&A pair: Q: {question.capitalize()}, A: {answer[:50]}...")
             logger.info(f"Accepted Q&A pair: Q: {question.capitalize()}, A: {answer[:50]}...")
         else:
-            print(f"Filtered out Q&A pair: Q: {question}, A: {answer[:50]}... (non-historical or too short)")
-            logger.debug(f"Filtered out Q&A pair: Q: {question}, A: {answer[:50]}... (non-historical or too short)")
+            print(f"Filtered out Q&A pair: Q: {question}, A: {answer[:50]}... (non-domain or too short)")
+            logger.debug(f"Filtered out Q&A pair: Q: {question}, A: {answer[:50]}... (non-domain or too short)")
     
     if not qa_pairs:
         print(f"No valid Q&A pairs found in output for chunk:\n{chunk[:500]}...")
@@ -353,27 +479,19 @@ def parse_qa_pairs(text, chunk, full_text):
     
     return deduplicate_qa_pairs(qa_pairs)
 
-def generate_questions_answers(chunk, full_text, model_name="llama3.1", max_retries=5):
-    """Generate 1–12 Q&A pairs about historical figures, events, and cultural items."""
+def generate_questions_answers(chunk, full_text, model_name="llama3.1", prompt_template: Optional[str] = None, keyword_set: Optional[Set[str]] = None, max_retries=5):
+    """Generate 1-12 Q&A pairs from a document chunk using a generic domain prompt."""
     print(f"Processing chunk (first 200 chars): {chunk[:200]}...")
     logger.info(f"Processing chunk (first 200 chars): {chunk[:200]}...")
     start_time = time.time()
-    prompt = f"""
-You are a historian tasked with generating 1–12 high-quality question-answer pairs from a given text passage for a fine-tuned question-answering model. Your output MUST be a valid JSON array containing 1–12 objects, each with the fields "instruction" (the question), "input" (the specific sentences or phrases from the passage that directly relate to the question and answer), and "output" (the answer). Do NOT include any text outside the JSON array (e.g., explanations, headings, Q: A: pairs). Non-JSON output will be discarded.
-
-Focus EXCLUSIVELY on questions about historical figures (e.g., rulers, leaders, warriors, scholars, missionaries), events (e.g., wars, battles, treaties, revolutions, movements), and cultural items or practices (e.g., traditions, rituals, ceremonies, literature, art, customs), including minor or less prominent ones. For the "input" field, include only the sentences or phrases from the passage that directly support the question and answer, ensuring the input is complete and meaningful. Answers must be at least 100 characters, include specific details (e.g., quotes, names, dates, roles, significance), and explicitly cite sources mentioned in the passage or note if no source is provided. Avoid non-historical topics (e.g., authorship, publication, supervisors, funding, table of contents, orthography, abbreviations, acknowledgments, definitions, structure). If the passage is short or lacks sufficient content, generate at least 1 high-quality pair, prioritizing historical relevance.
-
-Ensure answers are detailed, accurate, and contextually rich, drawing directly from the passage. Verify relationships and use primary sources or interviews cited in the passage for accuracy. If the passage lacks specific details, do NOT generate Q&A pairs based on external knowledge.
-
-Example output:
-[
-  {{"instruction": "What was the significance of the Battle of Hastings?", "input": "The Battle of Hastings in 1066 marked the Norman conquest of England.", "output": "The Battle of Hastings in 1066 was a pivotal moment that marked the Norman conquest of England, fundamentally changing English society, language, and governance under William the Conqueror's rule."}},
-  {{"instruction": "How did medieval guilds influence trade?", "input": "Medieval guilds controlled trade practices and maintained quality standards in cities.", "output": "Medieval guilds were powerful organizations that controlled trade practices, maintained quality standards, and regulated prices in cities, effectively shaping the economic landscape of medieval Europe through their monopolistic control over crafts and commerce."}}
-]
-
-Generate 1–12 high-quality question-answer pairs based on the following passage:
-\"\"\"{chunk}\"\"\"
-"""
+    try:
+        prompt = prompt_template.format(chunk=chunk)
+    except KeyError:
+        prompt = (
+            prompt_template.rstrip()
+            + "\n\nPassage:\n"
+            + chunk
+        )
 
     for attempt in range(max_retries):
         try:
@@ -383,7 +501,7 @@ Generate 1–12 high-quality question-answer pairs based on the following passag
                     "model": model_name,
                     "prompt": prompt,
                     "stream": False,
-                    "temperature": 0.5
+                    "temperature": 0.7
                 },
                 timeout=180
             )
@@ -398,7 +516,7 @@ Generate 1–12 high-quality question-answer pairs based on the following passag
                 f.write(f"Chunk response at {datetime.now()}:\n{raw}\n{'='*50}\n")
             print(f"Response time: {time.time() - start_time:.2f}s")
             logger.info(f"Response time: {time.time() - start_time:.2f}s")
-            return extract_json_array(raw, chunk, full_text)
+            return extract_json_array(raw, chunk, full_text, keyword_set)
         except Exception as e:
             print(f"Error processing chunk (attempt {attempt+1}/{max_retries}): {str(e)}")
             logger.error(f"Error processing chunk (attempt {attempt+1}/{max_retries}): {str(e)}")
@@ -409,32 +527,47 @@ Generate 1–12 high-quality question-answer pairs based on the following passag
             time.sleep(5)
     return []
 
-def process_chunk(i, chunk, full_text, model_name):
+def process_chunk(i: int, chunk: str, full_text: str, model_name: str, prompt_template: Optional[str], keyword_set: Set[str]):
     """Helper function to process a single chunk and return results."""
     log_system_metrics(i)
-    items = generate_questions_answers(chunk, full_text, model_name)
+    items = generate_questions_answers(chunk, full_text, model_name, prompt_template, keyword_set)
     return i, chunk, items
 
-def generate_dataset_from_pdf(pdf_path, output_path, model_name="llama3.1", start_chunk=0, temp_path=None, checkpoint_path="checkpoint.json", max_workers=4):
-    """Generate a dataset from a PDF and save to JSONL, processing chunks in parallel."""
+def generate_dataset_from_document(document_path: str, output_path: str, model_name: str = "llama3.1", keyword_method: str = "static", keywords_file: str = "keywords.txt", prompt_template_path: Optional[str] = None, prompt_string: Optional[str] = None, start_chunk: int = 0, temp_path: Optional[str] = None, checkpoint_path: str = "checkpoint.json", max_workers: int = 4):
+    """Generate a dataset from a document and save to JSONL, processing chunks in parallel."""
     if not check_ollama_health():
         print("Aborting: Ollama server not available")
         logger.error("Aborting: Ollama server not available")
         return
 
     if temp_path is None:
-        bookname = os.path.splitext(os.path.basename(pdf_path))[0]
+        bookname = os.path.splitext(os.path.basename(document_path))[0]
         temp_path = f"temp_{bookname}.jsonl"
     
     start_time = time.time()
-    full_text = read_pdf_text(pdf_path)
+    full_text = read_document_text(document_path)
     print(f"First 500 chars of full text: {full_text[:500]}")
     logger.info(f"First 500 chars of full text: {full_text[:500]}")
     if len(full_text) < 200:
         print(f"Warning: Input text is too short ({len(full_text)} chars). Consider augmenting with additional sources.")
         logger.warning(f"Input text is too short ({len(full_text)} chars). Consider augmenting with additional sources.")
-    
-    chunks = chunk_text(full_text)
+
+    keyword_extractor = create_keyword_extractor(keyword_method, keywords_file=keywords_file)
+    keyword_set = keyword_extractor.get_keywords(full_text)
+    print(keyword_set)
+    print(f"Keyword extraction method: {keyword_method}. Keywords loaded: {len(keyword_set)}")
+    logger.info(f"Keyword extraction method: {keyword_method}. Keywords loaded: {len(keyword_set)}")
+
+    prompt_template = DEFAULT_PROMPT_TEMPLATE
+    if prompt_string:
+        prompt_template = prompt_string
+        print("Using prompt template from command-line argument")
+    elif prompt_template_path and os.path.exists(prompt_template_path):
+        with open(prompt_template_path, 'r', encoding='utf-8') as f:
+            prompt_template = f.read()
+        print(f"Loaded prompt template from {prompt_template_path}")
+
+    chunks = chunk_text(full_text, keyword_set)
     
     if start_chunk < 0 or start_chunk >= len(chunks):
         print(f"Invalid start_chunk {start_chunk}; must be between 0 and {len(chunks)-1}")
@@ -468,7 +601,7 @@ def generate_dataset_from_pdf(pdf_path, output_path, model_name="llama3.1", star
                 futures = []
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     for i, chunk in batch:
-                        futures.append(executor.submit(process_chunk, i, chunk, full_text, model_name))
+                        futures.append(executor.submit(process_chunk, i, chunk, full_text, model_name, prompt_template, keyword_set))
                     
                     for future in as_completed(futures):
                         try:
@@ -520,7 +653,7 @@ def generate_dataset_from_pdf(pdf_path, output_path, model_name="llama3.1", star
                 log_system_metrics(i)
                 print(f"Retrying chunk {i}/{len(chunks)}")
                 logger.info(f"Retrying chunk {i}/{len(chunks)}")
-                items = generate_questions_answers(chunk, full_text, model_name)
+                items = generate_questions_answers(chunk, full_text, model_name, prompt_template, keyword_set)
                 with lock:
                     if items:
                         all_data.extend(items)
@@ -586,12 +719,26 @@ def generate_dataset_from_pdf(pdf_path, output_path, model_name="llama3.1", star
                 f"{stats['failed_chunks']} failed chunks, {stats['total_pairs']} total Q&A pairs")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate Q&A dataset from PDF")
-    parser.add_argument("pdf_path", help="Path to the PDF file")
+    parser = argparse.ArgumentParser(description="Generate Q&A dataset from a document")
+    parser.add_argument("document_path", help="Path to the source document file")
     parser.add_argument("output_path", help="Path for the output JSONL file")
+    parser.add_argument("--keyword-method", type=str, default="static", choices=["static", "tfidf", "nmf"], help="Keyword extraction method to use")
+    parser.add_argument("--keywords-file", type=str, default="keywords.txt", help="Path to a custom keyword file")
+    parser.add_argument("--prompt-template", type=str, default=None, help="Path to a custom prompt template file")
+    parser.add_argument("--prompt-string", type=str, default=None, help="Custom prompt template string")
     parser.add_argument("--start-chunk", type=int, default=0, help="Starting chunk index (0-based, default 0)")
     parser.add_argument("--model-name", type=str, default="llama3.1", help="Ollama model name (e.g., llama3.1, mistral)")
     parser.add_argument("--max-workers", type=int, default=4, help="Number of parallel workers (default 4)")
     args = parser.parse_args()
 
-    generate_dataset_from_pdf(args.pdf_path, args.output_path, model_name=args.model_name, start_chunk=args.start_chunk, max_workers=args.max_workers)
+    generate_dataset_from_document(
+        args.document_path,
+        args.output_path,
+        model_name=args.model_name,
+        keyword_method=args.keyword_method,
+        keywords_file=args.keywords_file,
+        prompt_template_path=args.prompt_template,
+        prompt_string=args.prompt_string,
+        start_chunk=args.start_chunk,
+        max_workers=args.max_workers
+    )
