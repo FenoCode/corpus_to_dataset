@@ -1,242 +1,341 @@
-# History Book to Dataset Generator ( PDF to dataset )
+# Document to Dataset Generator (General Corpus → Q&A Dataset)
 
-A Python tool that converts history books (PDF format) into question-answer datasets suitable for training AI models. The tool uses natural language processing and AI to automatically generate high-quality Q&A pairs from historical texts.
+A flexible Python tool that converts **any document corpus** (PDF, TXT, CSV, Markdown, etc.) into high-quality **question-answer datasets** for training or fine-tuning AI models.
 
-## Features
+Unlike traditional approaches that rely on static keyword lists, this tool introduces **automatic keyword extraction using NLP techniques (TF-IDF / NMF)**—making it adaptable to **any domain** (technical docs, legal text, novels, research papers, internal knowledge bases, etc.).
 
-- **PDF Processing**: Extracts text from PDF files and intelligently chunks it for processing
-- **AI-Powered Q&A Generation**: Uses Ollama (local AI models) to generate contextual questions and answers
-- **Historical Content Filtering**: Focuses on historical figures, events, and cultural practices
-- **Customizable Keywords**: Configure domain-specific historical keywords
-- **Parallel Processing**: Multi-threaded processing for faster dataset generation
-- **Resume Capability**: Checkpoint system allows resuming interrupted processing
-- **Deduplication**: Removes similar Q&A pairs to ensure dataset quality
-- **Comprehensive Logging**: Detailed logs for monitoring and debugging
+---
+
+## Key Features
+
+### Multi-Format Document Support
+- PDF (`.pdf`)
+- Text (`.txt`)
+- Markdown (`.md`)
+- CSV (`.csv`)
+- Fallback support for unknown formats
+
+---
+
+### Intelligent Keyword Extraction
+
+Choose how the system understands your domain:
+
+- **Static (default)**  
+  Uses predefined + custom keywords from `keywords.txt`
+
+- **TF-IDF (Recommended for general corpora)**  
+  Automatically extracts high-signal terms from your document
+
+- **NMF (Topic Modeling)**  
+  Extracts topic-based keywords for broader thematic understanding
+
+This removes the need to manually curate keywords for every dataset.
+
+---
+
+### AI-Powered Q&A Generation
+- Uses **Ollama local models** (e.g., `llama3.1`, `mistral`)
+- Generates **1–12 high-quality Q&A pairs per chunk**
+- Enforces structured JSON output
+
+---
+
+### Smart Text Chunking
+- Semantic chunking based on:
+  - Extracted keywords
+  - Named entities (people, locations, dates, etc.)
+- Falls back to sentence-level chunking if needed
+
+---
+
+### Data Quality Controls
+- Deduplicates similar Q&A pairs (cosine similarity)
+- Filters:
+  - Low-quality answers
+  - Non-domain content
+  - Meta/document structure questions (e.g., “who wrote this”)
+
+---
+
+### Performance & Reliability
+- Multi-threaded processing
+- Checkpointing (resume after interruption)
+- Failed chunk retry system
+- System monitoring:
+  - CPU
+  - Memory
+  - GPU (if available)
+
+---
+
+### Custom Prompting
+- Provide your own prompt template:
+  - File-based (`--prompt-template`)
+  - Inline (`--prompt-string`)
+- Enables domain-specific dataset shaping
+
+---
 
 ## Prerequisites
 
-### 1. Ollama Installation
+### 1. Install Ollama
 
-This tool requires Ollama to be installed and running on your system. Ollama provides local AI model inference.
-
-#### Install Ollama:
+Ollama is required for local model inference.
 
 **macOS/Linux:**
-
 ```bash
 curl -fsSL https://ollama.ai/install.sh | sh
-```
+````
 
 **Windows:**
-Download from [https://ollama.ai/download](https://ollama.ai/download)
+Download from: [https://ollama.ai/download](https://ollama.ai/download)
 
-#### Start Ollama and Download a Model:
+---
+
+### Start Ollama + Pull Model
 
 ```bash
-# Start Ollama service
-ollama start
+ollama serve
 
-# In another terminal, download a model (e.g., Llama 3.1)
+# In another terminal:
 ollama pull llama3.1
-
-# Run
 ollama run llama3.1
 ```
 
-Verify Ollama is running by visiting `http://localhost:11434` in your browser.
-
-### 2. Python Dependencies
-
-Activate a python virtual env
+Verify:
 
 ```
+http://localhost:11434
+```
+
+---
+
+### 2. Python Setup
+
+```bash
 python3 -m venv venv
 source venv/bin/activate
 ```
 
-Install the required Python packages:
+Install dependencies:
 
 ```bash
-pip install spacy download jsonlines requests tqdm PyPDF2 psutil textacy scikit-learn spacy pynvml
-```
-
-```
+pip install jsonlines requests tqdm PyPDF2 psutil textacy scikit-learn spacy pynvml
 python -m spacy download en_core_web_sm
 ```
+
+---
 
 ## Usage
 
 ### Basic Usage
 
-The script requires two mandatory parameters: the input PDF file path and the output dataset file path.
-
 ```bash
-python history_to_dataset.py <input_pdf_path> <output_jsonl_path>
+python script.py <input_document> <output_dataset.jsonl>
 ```
 
-**Examples:**
+Example:
 
 ```bash
-# Process a history book and save to dataset
-python history_to_dataset.py "my_history_book.pdf" "history_dataset.jsonl"
-
-# Process with specific paths
-python history_to_dataset.py "/path/to/book.pdf" "/path/to/output/dataset.jsonl"
+python script.py "book.pdf" "dataset.jsonl"
 ```
+
+---
+
+### Using Automatic Keyword Extraction (Recommended)
+
+```bash
+python script.py "research_paper.pdf" "dataset.jsonl" \
+    --keyword-method tfidf
+```
+
+Or with topic modeling:
+
+```bash
+python script.py "technical_docs.txt" "dataset.jsonl" \
+    --keyword-method nmf
+```
+
+---
+
+### Using Static Keywords (Manual Control)
+
+```bash
+python script.py "history_book.pdf" "dataset.jsonl" \
+    --keyword-method static \
+    --keywords-file keywords.txt
+```
+
+---
 
 ### Advanced Usage
 
 ```bash
-python history_to_dataset.py <input_pdf_path> <output_jsonl_path> \
+python script.py <input> <output> \
     --model-name llama3.1 \
-    --max-workers 4 \
-    --start-chunk 0
+    --keyword-method tfidf \
+    --max-workers 8 \
+    --start-chunk 50
 ```
 
-**Examples:**
+---
+
+### Custom Prompt Template
+
+#### Option 1: File
 
 ```bash
-# Using different model and more workers
-python history_to_dataset.py "book.pdf" "dataset.jsonl" --model-name mistral --max-workers 8
-
-# Resume processing from chunk 50
-python history_to_dataset.py "book.pdf" "dataset.jsonl" --start-chunk 50
+python script.py "doc.txt" "dataset.jsonl" \
+    --prompt-template custom_prompt.txt
 ```
 
-### Command Line Arguments
+#### Option 2: Inline
 
-**Required Arguments:**
-
-- `pdf_path`: Path to the input PDF file
-- `output_path`: Path for the output JSONL dataset file
-
-**Optional Arguments:**
-
-- `--model-name`: Ollama model to use (default: llama3.1)
-- `--max-workers`: Number of parallel processing threads (default: 4)
-- `--start-chunk`: Starting chunk index for resuming processing (default: 0)
-
-## Customizing Historical Keywords
-
-The tool uses historical keywords to identify and filter relevant content. You can customize these keywords by editing the `keywords.txt` file.
-
-### How to Add Custom Keywords:
-
-1. Open `keywords.txt` in a text editor
-2. Add one keyword per line (case-insensitive)
-3. Lines starting with `#` are comments and will be ignored
-4. Save the file
-
-### Example Keywords for Different Historical Domains:
-
-**African History:**
-
-```
-xhosa
-thembu
-maqoma
-ngqika
-nongqause
-phalo
-cattle-killing
+```bash
+python script.py "doc.txt" "dataset.jsonl" \
+    --prompt-string "Generate detailed technical Q&A from the following text: {chunk}"
 ```
 
-**European History:**
-
-```
-feudalism
-crusades
-reformation
-enlightenment
-napoleon
-charlemagne
-```
-
-**American History:**
-
-```
-colonial
-revolutionary
-civil war
-reconstruction
-manifest destiny
-new deal
-```
-
-The tool will automatically load your custom keywords when processing documents.
+---
 
 ## Output Format
 
-The tool generates a JSONL (JSON Lines) file where each line contains a Q&A pair in the following format:
+Each line in the output JSONL file:
 
 ```json
 {
-  "instruction": "What was the significance of the Battle of Hastings?",
-  "input": "The Battle of Hastings in 1066 marked the Norman conquest of England.",
-  "output": "The Battle of Hastings in 1066 was a pivotal moment that marked the Norman conquest of England, fundamentally changing English society, language, and governance under William the Conqueror's rule."
+  "instruction": "What is X?",
+  "input": "Relevant extracted context...",
+  "output": "Detailed answer..."
 }
 ```
 
-## Configuration
+---
 
-### Model Selection
+## How It Works (High-Level)
 
-You can use different Ollama models by specifying the `--model-name` parameter:
+1. Read document
+2. Extract keywords (static / TF-IDF / NMF)
+3. Chunk text based on semantic + entity relevance
+4. Generate Q&A via Ollama
+5. Filter and clean results
+6. Deduplicate
+7. Write JSONL dataset
 
-```bash
-# Using Mistral
-python history_to_dataset.py book.pdf dataset.jsonl --model-name mistral
+---
 
-# Using Llama 3.1 (default)
-python history_to_dataset.py book.pdf dataset.jsonl --model-name llama3.1
-```
+## Command Line Arguments
 
-### Performance Tuning
+### Required
 
-- **max-workers**: Adjust based on your system's CPU cores and memory
-- **GPU Usage**: The tool will automatically use GPU if available through Ollama
-- **Memory**: Monitor system memory usage; reduce max-workers if needed
+* `document_path` – Input file
+* `output_path` – Output dataset
 
-## Resuming Processing
+---
 
-If processing is interrupted, the tool automatically creates checkpoints. Simply run the same command again to resume from where it left off.
+### Optional
+
+| Argument            | Description                      |
+| ------------------- | -------------------------------- |
+| `--keyword-method`  | `static`, `tfidf`, `nmf`         |
+| `--keywords-file`   | Path to custom keywords          |
+| `--prompt-template` | Path to prompt file              |
+| `--prompt-string`   | Inline prompt override           |
+| `--model-name`      | Ollama model (default: llama3.1) |
+| `--max-workers`     | Parallel threads (default: 4)    |
+| `--start-chunk`     | Resume from chunk index          |
+
+---
+
+## Performance Tips
+
+* Increase `--max-workers` for faster processing (if CPU allows)
+* Use GPU-enabled Ollama for large documents
+* TF-IDF is faster; NMF is more semantic but heavier
+* Monitor system logs for bottlenecks
+
+---
+
+## Resume & Checkpoints
+
+* Progress saved to `checkpoint.json`
+* Partial output saved to `temp_<document>.jsonl`
+* Re-run the same command to resume
+
+---
 
 ## Logging
 
-The tool creates detailed logs in:
+Generated files:
 
-- `dataset_generation.log`: Main processing log
-- `raw_responses.log`: Raw AI model responses for debugging
+* `dataset_generation.log` – main log
+* `raw_responses.log` – raw model outputs
+
+---
+
+## Example Use Cases
+
+This tool is domain-agnostic:
+
+* Academic / research datasets
+* Internal knowledge base transformation
+* Legal or compliance document structuring
+* Technical documentation Q&A generation
+* Book or narrative comprehension datasets
+
+---
 
 ## Troubleshooting
 
-### Common Issues:
+### Ollama not reachable
 
-1. **"Ollama server not reachable"**
+Ensure:
 
-   - Ensure Ollama is installed and running (`ollama serve`)
-   - Check that port 11434 is not blocked
+```bash
+ollama serve
+```
 
-2. **"No historical keywords found"**
+---
 
-   - Review and update your `keywords.txt` file
-   - Ensure your PDF contains historical content
+### No Q&A pairs generated
 
-3. **Low Q&A pair generation**
+Try:
 
-   - Check if your PDF text extraction is working properly
-   - Verify that historical keywords match your content
-   - Consider using a different AI model
+* `--keyword-method tfidf`
+* Different model (e.g., `mistral`)
+* Adjusting the prompt
 
-4. **Memory issues**
-   - Reduce the `--max-workers` parameter
-   - Process smaller PDF files
-   - Monitor system resources
+---
+
+### Memory issues
+
+Reduce:
+
+```bash
+--max-workers
+```
+
+---
+
+### Poor output quality
+
+* Use a custom prompt template
+* Switch keyword extraction method
+
+---
 
 ## Contributing
 
-Feel free to submit issues, feature requests, or pull requests to improve this tool.
+Contributions are welcome:
+
+* Additional keyword extraction strategies
+* Improved filtering heuristics
+* Prompt engineering improvements
+
+---
 
 ## License
 
-This project is open source. Please check the license file for details.
+Open source – see license file for details.
+
